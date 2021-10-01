@@ -1,7 +1,9 @@
 from __future__ import print_function
 
+import time
 import numpy as np
 
+import tensorflow as tf
 from tensorflow.keras import backend as K
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Dense, Dropout, Input
@@ -10,6 +12,32 @@ from tensorflow.keras.regularizers import l2
 import p1b2
 import candle
 
+import horovod.tensorflow.keras as hvd
+
+start = time.time()
+
+# Horovod: initialize Horovod.
+hvd.init()
+
+# Horovod: pin GPU to be used to process local rank (one GPU per process)
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+if gpus:
+    tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
+
+# For strong scaling (inverse proportion), we keep the total number of epochs constant, decrease the number of epochs per GPU, and increase the number of GPUs.
+nprocs = hvd.size()
+myrank = hvd.rank()
+
+def comp_epochs(n, myrank=0, nprocs=1):
+    j = int(n // nprocs)
+    k = n % nprocs
+    if myrank < nprocs-1:
+        i = j
+    else:
+        i = j + k
+    return i
 
 def initialize_parameters(default_model='p1b2_default_model.txt'):
 
@@ -97,21 +125,56 @@ def run(gParameters):
     mlp = Model(outputs=output, inputs=input_vector)
     p1b2.logger.debug('Model: {}'.format(mlp.to_json()))
 
+    scaled_lr = gParameters['learning_rate'] * hvd.size()
+
     # Define optimizer
     optimizer = candle.build_optimizer(gParameters['optimizer'],
-                                       gParameters['learning_rate'],
+                                       scaled_lr,
                                        kerasDefaults)
 
+    # Horovod: add Horovod DistributedOptimizer.
+    optimizer = hvd.DistributedOptimizer(
+        optimizer, backward_passes_per_step=1, average_aggregated_gradients=True)
+
     # Compile and display model
-    mlp.compile(loss=gParameters['loss'], optimizer=optimizer, metrics=['accuracy'])
+    mlp.compile(loss=gParameters['loss'], optimizer=optimizer, metrics=['accuracy'], experimental_run_tf_function=False)
     mlp.summary()
+
+    # Horovod: write logs on worker 0.
+    verbose = 1 if hvd.rank() == 0 else 0
+
+    callbacks = [
+    # Horovod: broadcast initial variable states from rank 0 to all other processes.
+    # This is necessary to ensure consistent initialization of all workers when
+    # training is started with random weights or restored from a checkpoint.
+    hvd.callbacks.BroadcastGlobalVariablesCallback(0),
+
+    # Horovod: average metrics among workers at the end of every epoch.
+    #
+    # Note: This callback must be in the list before the ReduceLROnPlateau,
+    # TensorBoard or other metrics-based callbacks.
+    hvd.callbacks.MetricAverageCallback(),
+
+    # Horovod: using `lr = 1.0 * hvd.size()` from the very beginning leads to worse final
+    # accuracy. Scale the learning rate `lr = 1.0` ---> `lr = 1.0 * hvd.size()` during
+    # the first three epochs. See https://arxiv.org/abs/1706.02677 for details.
+    hvd.callbacks.LearningRateWarmupCallback(initial_lr=scaled_lr, warmup_epochs=3, verbose=1),
+    ]
 
     # Seed random generator for training
     np.random.seed(seed)
 
+    # Scale Hyperparameter
+    epochs = comp_epochs(gParameters['epochs'], myrank, nprocs)
+    # batch_size = gParameters['batch_size'] * hvd.size()
+
+    print(">>> Data Loading Time : ", time.time() - start, ">>> Rank : ", hvd.rank())
+
     mlp.fit(X_train, y_train,
+            verbose=verbose,
             batch_size=gParameters['batch_size'],
-            epochs=gParameters['epochs'],
+            epochs=epochs,
+            callbacks=callbacks,
             validation_data=(X_val, y_val)
             )
 
